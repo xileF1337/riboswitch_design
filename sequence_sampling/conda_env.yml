@@ -1,0 +1,11 @@
+name: test_blueprint
+channels:
+  - conda-forge
+  - bioconda
+  - defaults
+dependencies:
+  - perl
+  - perl-scalar-list-utils
+  - perl-autodie
+  - rnablueprint
+  - perl-ipc-system-simple

@@ -1,0 +1,1187 @@
+#!/usr/bin/env perl
+# Perform gradient descend / simmulated annealing with parallelized random
+# walkers.
+# File  : design_inserts
+#
+# Copyright 2017--2020 Felix Kuehnl
+#
+# This program is free software: you can redistribute it and/or modify
+# it under the terms of the GNU General Public License as published by
+# the Free Software Foundation, either version 3 of the License, or
+# (at your option) any later version.
+#
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU General Public License for more details.
+#
+# You should have received a copy of the GNU General Public License
+# along with this program.  If not, see <https://www.gnu.org/licenses/>.
+#
+#
+##############################################################################
+##                                 Modules                                  ##
+##############################################################################
+
+use warnings;
+use v5.16;                          # strictures, negative substr offsets
+use autodie qw( :all );             # automatically die with errors
+#use diagnostics;                   # it's REALLY verbose on errors.
+
+use Carp qw( carp croak );          # more informative warnings and errors
+use IO::Null;                       # Enable OO handle interface; null handles
+
+# Tools for scalars (references, numbers...) and lists
+use Scalar::Util qw( reftype openhandle looks_like_number);
+use   List::Util qw( any none reduce );
+# Cmd line argument parsing
+use Getopt::Long qw( :config no_ignore_case bundling );
+#use File::Temp qw(tempfile tempdir);   # generate temporary files
+#use Data::Dumper;                      # print Perl data structures
+#use File::Slurp;                       # efficiently read files at once
+use Math::Random::MT::Auto qw(rand srand irand );  # Mersenne twister rand nos
+
+use Math::Optimize::Walker;
+use Math::Optimize::Walker::Generate;
+use Math::Optimize::Walker::Decide;
+
+use RNA;
+
+
+##############################################################################
+##                              Script options                              ##
+##############################################################################
+
+# Name and version of this script
+my $SCRIPT_NAME            = 'design_inserts';
+my $SCRIPT_VERSION         = 'v0.1';
+
+# Valid counts for positional args. Leave empty to disable check.
+my @POSITIONAL_ARGS_COUNTS = ( 1, );
+
+# Set options to parse here. Trailing '=x' indicates type, where x is either
+# of s (string), i (integer), o (extended integer, eg -3), or f (real).
+# Missing '=' means flag / no values. Trailing '@' means multiple values,
+# <opt>! means flag with additional --no-<opt> option. Use '|' for aliases.
+my @OPTION_SPECS = qw(
+    position|p=i length|l=i unstructured|u max-mono|m=i normalize|n
+    walkers|w=i init-temp|T=f anneal-factor|a=f filter-prob|f=f seed|S=i
+    brute-force|b score|s=s threads|t=i verbose|v version debug|D help|h|?
+);
+
+
+##############################################################################
+##                                  Usage                                   ##
+##############################################################################
+
+my $USAGE= <<"EndOfUsage";
+Given a list of sequences and structural constraints, generate an insert of a
+given length at the specified sequence position that maximizes the probability
+that the given sequences including the insert fold into a structure that is
+compatible with these constraints.
+
+The structures are read from a single line fasta file containing, for each
+sequence, a header, the sequence and its constraint.
+
+Both a brute-force optimization, enumerating all sequences of the requested
+length, and a simmulated annealing strategy are available. Use the brute-force
+approach (-b) for short lengths (-l, e.g. up to 5 nt), then continue with a
+single random walker in verbose mode (-vw 1) to tweak the annealing parameters
+(-T, -a). To start with, try -T10 -a0.95 for fast results. Then, run with a
+large amount of walkers (e.g. -w 24) for different lengths to find good
+candidates.  Whenever a good candidate has been found, use its score as a
+filter (-f) to only print better results in future runs.
+
+Usage:  $SCRIPT_NAME [ARGS] INPUT.fa
+
+Arguments:  [...] denotes default values, xx doubles, ii ints, ss strings
+    -p, --position ii:
+        Position AFTER which the insert is supposed to be inserted. Position 0
+        inserts before the first nucleotide. [0]
+    -l, --length ii:    Length of the insert. [5]
+    -u, --unstructured:
+        Award designed inserts for not having internal base pairs.
+        TODO weigh this requirements against other scores. Currently, a higher
+        number of input sequences will reduce the weight of this criterion.
+    -m, --max-mono ii:
+        The maximum length of mono-nucleotide stretches (UUUUU, AAA etc.)
+        allowed in the designed insert. Set zero to disable restrictions. [0]
+        Warning: For small ii and long inserts, many initial sequences may
+        contain a mono-nucleotide strech of length > ii+1; the walker cannot
+        leave such sequences and will terminate without a result.
+    -n, --normalize:
+        Normalize scores with numbers of input constraints. Makes
+        scores comparable between input files with differing numbers of
+        sequences/constraints n. Specifically, score_norm = score^(1/n), i.e.
+        the score is now the geometric mean prob that the insert obeys each
+        constraint (instead of the prob that it obeys ALL constraints).
+    -w, --walkers ii:   Number of independent walkers / optimization runs. [8]
+    -T, --init-temp xx:
+        Initial temperature for the simulated annealing optimization. Large
+        temperatures lead to a more uniform sampling. [1000]
+    -a, anneal-factor:
+        Factor that is multiplied with the temperature in each optimization
+        step to simmulate a cooldown. Must lie in interval (0,1). Smaller
+        values accelerate the cooldown process and reduces the required
+        optimization steps. [0.99]
+    -f, --filter-prob:
+        Only print the result of an optimization walker if its probability is
+        at least this value. [0]
+    -S, --seed ii:      Manually set the random number seed. [RANDOM]
+    -b, --brute-force:  Optimize by complete enumeration (slow).
+    -s, --score ss:     Don't optimize, but only score passed insert ss.
+    -t, --threads ii:   Number of threads for parallel random walkers.
+                        [CPU count]
+    -v, --verbose:      Be verbose.
+    -D, --debug:        Print debug information.
+    --version:          Print the program version and exit.
+    -h, -?, --help:     Show this help and exit.
+EndOfUsage
+
+
+##############################################################################
+##                            Core sub routines                             ##
+##############################################################################
+
+# Extract a value from an option hash. If the option does not exist in the
+# passed hash, a default value is returned if it was passed. If no default
+# value was passed, the function returns undef in scalar context and the empty
+# list in list context.
+# A function performing a sanity check may be passed. If the check fails, this
+# sub croaks. If this function is called in list context and the return value
+# is an array reference, it is dereferenced automatically.
+# Arguments:
+#   opt_ref: reference to a hash containing options
+#   opt_name: string of the options name
+#   default: optional, default value if opt_name is not defined
+#       [default: undef / () in scalar / list context]
+#   sanity check function: a function that returns a true value if value $_
+#       is safe to use for this argument, and a false value otherwise. A
+#       warning is interpreted as a failed check, e.g. "foo" < 3 will fail.
+# Returns: value of the option if it has been defined, otherwise the default
+#   value. In list context, array refs are auto-dereferenced.
+sub get_opt ( \%$;$& ) {
+    my ($opt_ref, $opt_name, $default, $is_sane) = @_;
+    $default = wantarray ? [] : undef unless defined $default;
+
+    my $opt_value;
+    if (exists $opt_ref->{$opt_name}) {     # argument has been specified
+        $opt_value = $opt_ref->{$opt_name};
+
+        if (defined $is_sane) {                 # sanity check requested
+            my $sanity_fail_msg = "Illegal value '$opt_value' passed for arg "
+                                  . (length $opt_name > 1 ? '--' : '-')
+                                  . $opt_name;
+            # Locally fatalize warnings, e.g. to die in a check like "foo" < 3
+            local $SIG{__WARN__} = sub { croak "$sanity_fail_msg ($_[0])" };
+            local $_ = $opt_value;              # move arg to $_ for is_sane()
+
+            croak $sanity_fail_msg unless $is_sane->();   # die if check fails
+        }
+    }
+    else {                      # argument has NOT been specified, use default
+        $opt_value = $default;
+    }
+
+    # De-reference in list context
+    return wantarray && reftype $opt_value eq reftype []
+        ? return @{ $opt_value }
+        : return $opt_value;
+}
+
+
+# Check that if option is defined in the argument hash, none of the
+# incompatible options is also defined. Croaks if check fails.
+# Arguments:
+#   option hash:       Hash that stores all options as parsed by GetOptions.
+#   option:            The option to check for.
+#   incompatible_opts: All options incompatible to option from above.
+# Void. Croaks if check fails.
+sub check_incompatible_opts ( \% $ @ ) {
+    my ($opt_hash_ref, $option, @incompatible_options) = @_;
+
+    return unless exists $opt_hash_ref->{$option};
+    foreach (@incompatible_options) {
+        croak "Option --$option is not compatible with option --$_"
+            if exists $opt_hash_ref->{$_};
+    }
+}
+
+
+##############################################################################
+##                              Option parsing                              ##
+##############################################################################
+
+# For Getopt::Std
+sub VERSION_MESSAGE {
+    # Center string by adding padding spaces
+    my $out_handle = @_ ? shift : \*STDOUT;     # Print to this handle
+    my $line_length = 78;
+    my $message     = "* * * $SCRIPT_NAME $SCRIPT_VERSION * * *";
+
+    my $pad = ($line_length - length $message)  /  2;
+    $pad    = 0 if $pad < 0;
+
+    $out_handle->say( " " x $pad, $message );
+}
+
+sub HELP_MESSAGE {
+    my $max_lines = 30;
+    my $out_handle;
+    if ( (() = $USAGE =~ m{ \n }xg) <= $max_lines ) {
+        $out_handle = \*STDOUT;
+    }
+    else {          # Pipe output through less if we have many lines
+        open $out_handle, '| less';
+    }
+
+    VERSION_MESSAGE $out_handle;
+    say $out_handle "\n", $USAGE;
+    exit 0;
+}
+
+my %opt;                                 # All args will be stored here
+GetOptions( \%opt, @OPTION_SPECS)
+    or croak "Error while parsing command line arguments, use -h to get help";
+HELP_MESSAGE(),     exit 0 if $opt{'help'   };
+VERSION_MESSAGE(),  exit 0 if $opt{'version'};
+
+
+# Check whether the correct number of positional args has been supplied
+croak "Wrong number of positional arguments, use -h to get help.\n"
+      . "(valid argument counts: " . join(q{ }, @POSITIONAL_ARGS_COUNTS) . ")"
+    if @POSITIONAL_ARGS_COUNTS and none {$_ == @ARGV} @POSITIONAL_ARGS_COUNTS;
+
+# Clean up
+undef $USAGE;
+undef @POSITIONAL_ARGS_COUNTS;
+undef @OPTION_SPECS;
+
+
+##############################################################################
+##                   Global variables and default values                    ##
+##############################################################################
+
+##### Global variables #####
+# Generate a handle for log output. Set to null handle unless verbosity
+# needed. Use $log->say( "..." ) to output as say {$log} "..." emits warnings.
+# Can be enabled in a function by localizing and resetting dbg/log to STDOUT.
+our $log = ( get_opt(%opt, 'verbose') || get_opt(%opt, 'debug') )
+           ? \*STDERR
+           : IO::Null->new();
+our $dbg = get_opt(%opt, 'debug'  ) ? \*STDERR : IO::Null->new();
+
+
+##### Options #####
+# my $example = get_opt %opt, 'e', 'default_val', sub { $_ < 0 };
+my $insert_length    = get_opt %opt,        'length',     5, sub { $_ >  0 };
+my $insert_position  = get_opt %opt,      'position',     0, sub { /^\d+$/ };
+my $do_bruteforce    = get_opt %opt,   'brute-force';
+my $insert_to_score  = get_opt %opt,         'score', undef,
+                                                       sub { /^[AUGCT]*$/i };
+my $walker_count     = get_opt %opt,       'walkers',     8, sub { /^\d+$/ };
+my $thread_count     = get_opt %opt,       'threads', undef, sub { $_ > 0  };
+my $min_allowed_prob = get_opt %opt,   'filter-prob',     0;
+my $init_temperature = get_opt %opt,     'init-temp',  1000, sub { $_ > 0  };
+my $rand_seed        = get_opt %opt,          'seed', irand;
+my $annealing_factor = get_opt %opt, 'anneal-factor',   .99,
+                                                     sub { $_ > 0 and $_ < 1};
+my $award_unstructured   = get_opt %opt, 'unstructured';
+my $max_mono_stretch_len = get_opt %opt, 'max-mono', 0;
+my $do_normalize         = get_opt %opt, 'normalize';
+
+# Use all available threads unless count was specified by user. Set here to
+# make call to get_cpu_count() lazy and avoid loading Sys::Info module if not
+# available to user.
+$thread_count = get_cpu_count() unless $thread_count;
+
+
+##### Positional arguments #####
+my $input_fasta = shift;
+
+
+##### Check for incompatible options #####
+check_incompatible_opts %opt, 'brute-force', qw( walkers threads filter-score
+                                                 init-temp anneal-factor
+                                               );
+check_incompatible_opts %opt, 'score', qw( length brute-force walkers threads
+                                           filter-score init-temp
+                                           anneal-factor
+                                         );
+
+
+
+##############################################################################
+##                           Program sub routines                           ##
+##############################################################################
+
+# Prints version string and all set parameters to STDERR via dbgm()
+# Arguments: option hash
+sub print_initial_debug_messages ( \% ) {
+    my %opt = %{ shift() };
+
+    VERSION_MESSAGE($log);
+    my $all_args;
+    for my $arg (sort keys %opt) {
+        $all_args .= "$arg: "       # expand arrays
+            . ( ref $opt{$arg} && ref $opt{$arg} eq ref []
+                ? "[ " . join(", ", @{$opt{$arg}}) . " ]"
+                : $opt{$arg}
+              )
+            . "   ";
+    }
+    $log->say($all_args);           # print all passed arguments
+}
+
+
+# Retrieve the number of CPUs / cores installed on the current machine.
+sub get_cpu_count {
+    ##### Modules for retrieving number of cpus / cores
+    # Sys::CPU has vanished from CPAN...
+    # use Sys::CPU;           # Get number of CPU cores
+    eval {
+        require Sys::Info;
+        Sys::Info->import();
+
+        require Sys::Info::Constants;
+        Sys::Info::Constants->import( qw( :device_cpu ) );
+    };
+    # Yees, Sys::Info::Constants is installed via Sys::Info::Base.
+    croak "Need Sys::Info and Sys::Info::Base modules to determine CPU ",
+          "count of the system. Either install them or use -t to manually ",
+          "set the number of threads"
+        if $@;
+
+    # my $cpu_count = Sys::CPU::cpu_count();        # for Sys::CPU
+    my $cpu_count = Sys::Info->new()->device(CPU => {})->count;
+
+    croak "Could not retrieve number of CPUs, set manually using -t option"
+        unless $cpu_count > 0;
+
+    return $cpu_count;
+}
+
+
+# Iterator for files. By default, returns an iterator that reads a single line
+# from the supplied file name. If additionally an iterator factory accepting a
+# file handle is passed, it will be used on the opened file handle instead.
+# Arguments:
+#   file_name: Name of input file. Can also be a reference to a scalar, in
+#       which case the iterator factory will be called with a handle to the
+#       scalar (e.g. to iterate over strings in memory)
+#   iterator factory (optional): a function accepting a file handle and
+#       returning an iterator. By default, an iterator reading a single line
+#       per call is used.
+# Returns iterator.
+sub get_file_iter {
+    my ($input_file_name, $get_handle_iter) = @_;
+    # Default iter factory: makes iterator reading a single line from given
+    # file handle
+    $get_handle_iter ||= sub {
+        my $file_handle = shift;
+        return sub { <$file_handle> }
+    };
+
+    open my $input_handle, '<', $input_file_name;
+    my $handle_iter = $get_handle_iter->($input_handle);
+    my $input_handle_closed;                # keep track of file handle status
+
+    return sub {
+        return if $input_handle_closed;     # handle already closed
+
+        if (wantarray) {            # in list context, return all records
+            my @next = $handle_iter->();
+            $input_handle_closed = 1;
+            close $input_handle;    # close unconditionally
+            return @next;
+        }
+        else {                      # return single record
+            my $next = $handle_iter->();
+            do {$input_handle_closed = 1; close $input_handle}
+                unless defined $next;
+            return $next;
+        }
+    }
+}
+
+
+# Factory for iterators that read single line fasta files containing headers,
+# sequences and, importantly, for each sequence a constraint. Each item has to
+# be exactly one line in the input file. Blank lines are ignored.
+# Returns an iterator that, with each call, returns a fasta record hash ref
+# containing the entries 'header', 'sequence' and 'constraint'.
+sub oneline_fasta_iter_factory {
+    my $file_handle = shift;
+    my $file_handle_closed;
+
+    return sub {
+        return if $file_handle_closed;
+
+        my $entry = {};
+        my @entries;
+        while (<$file_handle>) {
+            chomp;
+            if (/^$/) {
+                next;                       # skip blank lines
+            }
+            elsif (/^>/) {
+                s/^>\s*//;                  # remove '>' and leading space
+                $entry->{header} = $_;
+            }
+            elsif (/^[AUGCT]+$/i) {
+                $entry->{sequence} = $_;
+            }
+            elsif (/^[()|.x<>\[\]]+$/) {
+                $entry->{constraint} = $_;
+                foreach my $part (qw( header sequence )) {
+                    croak "Missing $part at line $. of input fasta file"
+                        unless defined $entry->{$part};
+                }
+                $dbg->say( "Read fasta record from file:");
+                $dbg->say( $entry->{$_} )
+                    foreach qw( header sequence constraint );
+                # Constraint marks end of entry. Return single entry in scalar
+                # context or collect all entries in list context.
+                if (wantarray) {
+                    push @entries, $entry;
+                    $entry = {};
+                }
+                else {
+                    return $entry;
+                }
+            }
+            else {
+                croak "Unrecognized input '$_'";
+            }
+        }
+        $file_handle_closed = 1;
+
+        croak 'Incomplete FASTA entry (need header, sequence and constraint)'
+            unless keys %$entry == 0 or keys %$entry == 3;
+
+        return @entries if wantarray;       # return list of collected entries
+        return;                             # end of file, no more lines
+    }
+}
+
+# Given a sequence and a constraint, compute the ensemble energy of both the
+# full structure ensemble and the constrained ensemble.
+# Arguments:
+#   sequence:           Input RNA/DNA sequence.
+# Optional arguments:
+#   constraint:         Structural constraint in ViennaRNA notation.
+#                       Defaults to unconstrained ensemble.
+#   enforce_constraint: Bool. Enforce presence of basepairs? [0]
+# Returns structure ensemble energy.
+sub ensemble_energy {
+    my ($sequence, $constraint, $enforce_constraint) = @_;
+
+    my $ensemble_energy;
+    eval {
+        # my $model = RNA::md->new();            # model details object
+        # $model->swig_dangles_set(0);        # disable dangles for ext constr
+        my $fold_compound       = RNA::fold_compound->new( $sequence, );
+                                                         #  $model     );
+
+        # Set constraint options
+        my $constraint_options  = RNA::CONSTRAINT_DB_DEFAULT;    # bit mask
+        $constraint_options    |= RNA::CONSTRAINT_DB_ENFORCE_BP
+            if $enforce_constraint;
+
+        # Add hard constraint and compute constrained partition function
+        # $fold_compound->hc_init();
+        $fold_compound->hc_add_from_db( $constraint, $constraint_options )
+            if $constraint;
+
+        $ensemble_energy = ($fold_compound->pf)[1];
+    };
+    say STDERR "ViennaRNA error: sequence $sequence  constraint $constraint\n"
+            . $@
+          and return 0.0
+      if $@;
+
+  return $ensemble_energy;
+}
+
+# Extract outermost level of nested brackets. Returns array of start and end
+# positions.
+sub get_outer_bracket_level ($) {
+    my $constraint = shift;
+
+    $dbg->say( "get_outer_bracket_level()..." );
+    # Find positions and type (opening, closing) of all brackets in constraint
+    my (@brackets, @bracket_pos);
+    while ($constraint =~ m{ ( [\[\]] ) }xg) {          # find '[' and ']'
+        push @brackets,    $1;
+        push @bracket_pos, $-[1];
+    }
+    $dbg->say( "    Found ", scalar(@brackets), " brackets." );
+    return unless @brackets;
+    $dbg->say( "    Positions: ", join(", ", @bracket_pos));
+
+    my @outer_bracket_level;
+    while (@brackets) {
+        my $opening_bracket     = shift @brackets;
+        my $opening_bracket_pos = shift @bracket_pos;
+        croak "Unbalanced closing $opening_bracket bracket at position "
+              . "$opening_bracket_pos in constraint $constraint"
+            unless $opening_bracket eq '[';
+
+        my $open_bracket_count = 1;
+        my $bracket_pos;
+        while (@brackets and $open_bracket_count) {
+            my $bracket  = shift @brackets;
+            $bracket_pos = shift @bracket_pos;
+
+            if ($bracket eq '[') {
+                $open_bracket_count++;
+            }
+            else {
+                $open_bracket_count--;
+            }
+        }
+        croak "Unbalanced opening bracket in constraint $constraint"
+            if $open_bracket_count;
+
+        # Store array of start / end position pairs
+        push @outer_bracket_level, [ $opening_bracket_pos, $bracket_pos ];
+    }
+
+    $dbg->say( "    Pairs: ", join(', ',
+                              map {"($_->[0],$_->[1])"} @outer_bracket_level),
+               "\nreturn"
+             );
+    return @outer_bracket_level;
+}
+
+
+# Extension of ensemble_energy allowing [ ] constraints.
+# This requires using the dangling end model 0.
+sub ensemble_energy_ext {
+    my ($sequence, $constraint, $enforce_constraint) = @_;
+    $dbg->say( "ensemble_energy_ext()..." );
+    my @outer_bracket_level = get_outer_bracket_level $constraint;
+
+    return ensemble_energy $sequence, $constraint, $enforce_constraint
+        unless @outer_bracket_level;       # no extended constraints required
+    # $log->say("Found brackets, using extended constraints.");
+
+    # local $RNA::dangles;
+    # unless ($RNA::dangles == 0) {
+    #     $RNA::dangles = 0;
+    #     $log->say("Enforcing dangling end model 0 for extended constraints.");
+    # }
+
+    # Add up energy contributions of each bracketed subsequence
+    my $ensemble_energy = 0;
+    foreach (@outer_bracket_level) {
+        my ($start, $end) = @$_;
+        my $length = $end - $start + 1;
+
+        my $subsequence = substr $sequence, $start, $length;
+        my $subconstraint               # override subconstraint with xxxxx
+            = substr $constraint, $start, $length, ('x' x $length);
+
+        # Remove [ and ] from subconstraint
+        use v5.16;                              # for negative substr offsets
+        substr($subconstraint,  0, 1) = '.';
+        substr($subconstraint, -1, 1) = '.';
+
+        # Add subsequence energy contributions
+        $dbg->say("    Adding contribution of $subsequence / $subconstraint");
+        my $contribution = ensemble_energy_ext( $subsequence,
+                                                $subconstraint,
+                                                $enforce_constraint
+                                              );
+
+        $dbg->say("    Result: ", $contribution);
+        $ensemble_energy += $contribution;
+    }
+
+    # Add outside energy contributions
+    $dbg->say("    Adding outside contribution of $sequence / $constraint");
+    my $contribution
+        = ensemble_energy $sequence, $constraint, $enforce_constraint;
+
+    $dbg->say( "    Result: ", $contribution,
+               "\nreturn" );
+    $ensemble_energy += $contribution;
+
+    return $ensemble_energy;
+}
+
+# Computes the probability of structures matching a given constraint.
+# Arugments:
+#   sequence
+#   constraint: structural constraint in ViennaRNA notation; partition
+#       function of all matching structures is computed
+#   option: hash ref containing the following keys:
+#       is_constraint: Bool. If false, interpret the constraint string as
+#           exact secondary structure and compute the structure's probability.
+#           [1]
+#       enforce_constraint: Bool. Enforce presence of base pairs that are
+#           denoted as parentheses in the constraint string [0]
+# Returns the probability of all structures matchin the constraint in the
+# ensemble.
+sub structure_probability {
+    my ($sequence, $constraint, $option) = @_;
+    $option ||= {};             # init with empty hash
+
+    #### Log output ####
+    $dbg->say( $sequence   );
+    $dbg->say( $constraint );
+
+    #### Preparation ####
+    # Default to 'constraint mode'
+    $option->{is_constraint} = 1 unless exists $option->{is_constraint};
+
+    # Computing the partition function of a single structure is the same as
+    # interpreting its dot-bracket string as a constraint, prohibiting pairing
+    # (x) at all unpaired positions and enforcing the presence of all base
+    # pairs.
+    unless ($option->{is_constraint}) {
+        $constraint =~ s/[.]/x/g;
+        $option->{enforce_constraint} = 1;
+    }
+
+    #### Probability calculations ####
+    my $ensemble_energy_full   = ensemble_energy $sequence;
+    my $ensemble_energy_constr = ensemble_energy_ext $sequence,
+                                                 $constraint,
+                                                 $option->{enforce_constraint};
+    $dbg->say( "full ensemble energy: $ensemble_energy_full"   );
+    $dbg->say( "cons ensemble energy: $ensemble_energy_constr" );
+
+    # Define constants
+    state $R = RNA::GASCONST / 1000;       # universal gas constant for kcal/mol
+    state $T = 273.15 + $RNA::temperature; # temperature in Kelvin
+    state $RT_inv = 1 / ($R * $T);
+
+    # Compute probability
+    my $struct_prob = exp(
+                           ($ensemble_energy_full - $ensemble_energy_constr)
+                           * $RT_inv
+                         );
+
+    return $struct_prob;
+}
+
+# Convert an ensemble or structure energy into its corresponding partition
+# function, or a difference of ensembles into a probability.
+sub energy2pf ($) {
+    my $energy = shift;
+
+    # Define constants
+    state $R = RNA::GASCONST / 1000;       # universal gas constant for kcal/mol
+    state $T = 273.15 + $RNA::temperature; # temperature in Kelvin
+    state $RT_inv = 1 / ($R * $T);
+
+    # Compute probability
+    my $probability = exp( -1 * $energy * $RT_inv );
+
+    return $probability;
+}
+
+
+# Format float number as percent
+sub percent ($) {
+    return sprintf "%6.2f%%", $_[0] * 100;      # 6 positions to include sign
+}
+
+
+# Test whether the given sequence has a mono-nucleotide stretch of the given
+# length (e.g. 8xU). The function tests for any repeated character.
+# Arguments:
+#   seq: the sequence to test
+#   stretch_len: the minimum number a character needs to be repeated to be
+#       considered a mono-stretch.
+# Returns 1 if the sequence has a mono-strech of the given length, and undef
+# otherwise.
+sub has_mono_stretch {
+    my ($seq, $stretch_len) = @_;
+
+    my @seq_chars = split //, $seq;
+    return unless @seq_chars;               # empty sequence has no repeats
+
+    my ($last_char, $repeat_count) = (shift(@seq_chars), 1);
+
+    # Sequentially read through sequence and determine length of contiguous
+    # character runs.
+    foreach my $current_char (@seq_chars) {
+        if ($current_char eq $last_char) {
+            $repeat_count++;
+        }
+        else {
+            $repeat_count = 1;
+            $last_char    = $current_char;
+        }
+        return 1 if ($repeat_count >= $stretch_len);         # should be equal
+    }
+
+    return;                         # no repeat found
+}
+
+
+# Factory for objective functions. The factory takes a sequence position (0 is
+# before first char, 1 after first char, 2 after second char etc) and a list
+# of sequence records containing a sequence and a constraint. The constructed
+# objective function takes as argument a sequence insert, puts it at the
+# passed position in all sequences, and scores the probability that the
+# sequences fold into structures satisfying their respective constraint. The
+# constraint is filled up with a number of dots (.) equalling the length of
+# the insert sequence at the insert position. The negative of this probability
+# is returned such that the objective is minimal (-1) if all sequences
+# including the current insert satisfy their constraint with a probability of
+# 1.
+sub insert_objective_factory {
+    my ($insert_position, $score_insert_itself, @input_records) = @_;
+
+    # For extended constraints, use dangling model 0 instead.
+    my $uses_extended_constraints
+        = any { $_->{constraint} =~ /[\[\]]/ } @input_records;
+    if ($uses_extended_constraints) {
+        # Unfortunately, this variable cannot be localized as its value is
+        # restored after the factory returns, and thus is reset to the
+        # original value by the time it is called from the subroutines in the
+        # objective sub. Localizing in the objective itself is more costly.
+        $RNA::dangles = 0;
+        $log->say("Found extended constraints, using dangling model 0.");
+    }
+
+    my $enforce_constraints = 0;        # dont need this
+
+    return sub {
+        my $insert        = shift;
+        my $insert_length = length $insert;
+
+        # If requested, check for mono-nucleotide streches.
+        if ($max_mono_stretch_len) {
+            return 'Inf' if has_mono_stretch $insert, $max_mono_stretch_len+1;
+        }
+
+        # Compute and store scores for each individual sequence
+        my $combined_score = 0;
+        foreach my $record (@input_records) {
+            my $extended_sequence   = $record->{sequence  };
+            my $extended_constraint = $record->{constraint};
+
+            # Add insert into original sequence, and extend constraint
+            substr $extended_sequence,   $insert_position, 0, $insert;
+            substr $extended_constraint, $insert_position, 0,
+                                                        '.' x $insert_length;
+            my $ensemble_energy_full
+                = ensemble_energy     $extended_sequence;
+            my $ensemble_energy_constr
+                = ensemble_energy_ext $extended_sequence,
+                                      $extended_constraint,
+                                      $enforce_constraints;
+            my $sequence_score
+                = $ensemble_energy_constr - $ensemble_energy_full;
+            $dbg->say("Scoring sequence $record->{header}: $sequence_score");
+
+            # Sum up energy differences such that the sum corresponds to
+            # product of single sequence probabilities.
+            $combined_score += $sequence_score;
+        }
+        $combined_score += $score_insert_itself->($insert)      # score insert
+            if defined $score_insert_itself;
+
+        if ($do_normalize) {
+            # Count number of input sequences and add one of insert itself is
+            # scored, too.
+            my $term_count   = @input_records
+                               + (defined $score_insert_itself ? 1 : 0);
+            $combined_score /= $term_count;                     # normalize
+        }
+
+        return $combined_score;
+    }
+}
+
+
+# Factory for an iterator that sucessively generates all RNA (AUGC) sequences
+# of the given length.
+# Arguments:
+#   sequence_length: length of the sequences that are to be generated.
+# Returns iterator that returns with each call the next RNA sequence of the
+# specified length until all sequences have been generated.
+sub sequence_enumerator_factory {
+    my $sequence_length = shift;
+
+    my $current_sequence = 'A' x $sequence_length;      # start with AAA...
+    my %next_base = ( A => 'U',   U => 'G',   G => 'C',   C => 'A' );
+
+    my $is_finished;        # have we already generated all sequences?
+    my $is_first = 1;
+
+    # In each iteration, 'increase' a base (like increasing a number)
+    # beginning from the rightmost position to construct the next sequence.
+    return sub {
+        return if $is_finished;     # already generated all sequences
+        # At the first run, return AAAA.... without modifying it
+        $is_first = 0, return $current_sequence if $is_first;
+
+        my $position = $sequence_length - 1;        # rightmost position
+        while ($position >= 0) {
+            my $current_base = substr $current_sequence, $position, 1;
+            substr($current_sequence, $position, 1)
+                = $next_base{$current_base};        # overwrite with next base
+
+            # If a 'C' has been overwritten, we need to continue with the next
+            # position to the left
+            last unless $current_base eq 'C';
+            $position--;
+        }
+        $is_finished = 1, return if $position < 0;
+        return $current_sequence;
+    }
+}
+
+
+# Iterator factory for progress printers, i.e. iterators that count how often
+# they have been called and successively print a progress bar to STDOUT with
+# every call, until a pre-defined amount of calls has been reached.
+# Arguments:
+#   total_count: number of calls that corresponds to 100% progress
+# Returns iterator which prints the progress with every call up to 100% when
+# the total number of calls has been reached. The first call does NOT count
+# into the total call count and prints the empty bar. Iterator returns the
+# current count (in case you want to know).
+sub progress_printer_factory {
+    my $total_count = shift;        # total number of calls (100% progress)
+
+    my $count = 0;                  # counts calls
+    my $old_symbol_count = 0;       # how many '#' printed last time?
+
+    # Enable autoflushing for proper printing of the progress bar
+    require IO::Handle;
+    open my $stdout, '>&', \*STDOUT;    # dupe STDOUT to autoflush only here
+    $stdout->autoflush();               # print immediately
+
+    return sub {
+        if ($count == 0) {          # print percent values and empty bar
+            $stdout->say( '|',   q{ } x 8,
+                          '25%', q{ } x 7,
+                          '50%', q{ } x 7,
+                          '75%', q{ } x 9,
+                          '|100%'
+                        );
+        }
+        elsif ($count < $total_count) {
+            $stdout->print('|') if $count == 1;     # mark first call with bar
+
+            # Only call expensive print if we need to print new symbols
+            my $new_symbol_count   = int(40 * $count / $total_count);
+            my $print_symbol_count = $new_symbol_count - $old_symbol_count;
+            $stdout->print('#' x $print_symbol_count) if $print_symbol_count;
+
+            $old_symbol_count = $new_symbol_count;
+        }
+        else {
+            if ($stdout) {                          # final call, finalize bar
+                $stdout->print(('#' x (40-$old_symbol_count)), "|\n");
+                close $stdout;                      # close duped STDOUT
+                undef $stdout;
+            }
+        }
+        return $count++;
+    }
+}
+
+
+# Optimize an objective function by testing ALL posible sequences of the given
+# length.
+# Arguments:
+#   sequence_length: length of the sequence to optimize
+#   objective_function: code ref that, when called on a sequence, gives back
+#       its score which is to be MINIMIZED
+# Returns:
+#   best_sequence: the best sequence (i.e. the one minimizing the objective)
+#   best_sequence_score: score of the best sequence
+sub bruteforce_optimization {
+    my ($sequence_length, $objective_function) = @_;
+
+    my $number_of_sequences = 4**$sequence_length;
+
+    my $sequence_generator = sequence_enumerator_factory $sequence_length;
+    my $progress_printer   = progress_printer_factory    $number_of_sequences;
+    $progress_printer->();              # first line of progress bar
+
+    # Find optimal sequence (with lowest score since we minimise)
+    my ($best_sequence, $best_sequence_score) = (undef, 'Inf');
+    while (my $sequence = $sequence_generator->()) {
+        my $score = $objective_function->($sequence);
+        if ($score < $best_sequence_score) {            # minimize
+            $log->say( "Next improvement: $sequence  score: "
+                       . percent energy2pf $score
+                     );
+            $best_sequence       = $sequence;
+            $best_sequence_score = $score;
+        }
+        $progress_printer->();              # update progress bar
+    }
+
+    return ($best_sequence, $best_sequence_score);
+}
+
+
+# Construct and run a walker object to optimize a sequence of the given length
+# for the given objective function. The objective is minimized.
+# Arguments:
+#   sequence_length: length of the sequence to optimize
+#   objective_function: code ref that, when called on a sequence, gives back
+#       its score which is to be MINIMIZED
+#   init_temperature:  initial temperature for the simulated annealing process
+#   annealing_factor:  is multiplied with temperature in each step; in (0,1)
+# Returns:
+#   init_state:        initial sequence of the optimization run
+#   init_state_score:  score of the initial sequence
+#   final_state:       final (i.e. optimized) sequence of the optimization run
+#   final_state_score: score of the final sequence
+#   step_count:        number of steps performed during the walk
+sub run_walker {
+    my ( $sequence_length, $objective_function, $init_temperature,
+         $annealing_factor, $rand_seed,
+       ) = @_;
+
+    # We need different random seeds for the generator and the decision
+    # function. Use the global seed to generate other seeds.
+    my $rand_gen = Math::Random::MT::Auto->new(seed => $rand_seed);
+
+    # Build new generator / new initial sequence in each optimization attempt
+    my $sequence_generator
+        = Math::Optimize::Walker::Generate::sequence_generator_factory(
+            $sequence_length,
+            {seed => $rand_gen->irand},
+          );
+
+    # Build new decision function to reset annealing state
+    my $decision_function
+        = Math::Optimize::Walker::Decide::simulated_annealing_factory(
+            $init_temperature,
+            $annealing_factor,
+            1e-8,       # epsilon
+            {
+                log  => $log,
+                seed => $rand_gen->irand,
+            },
+          );
+
+    # Number of neighbors of the sequence: each position can be mutated to one
+    # of three different nucleotides.
+    my $neighbor_count = 3 * $sequence_length;
+
+
+    # Optimize sequence under objective function
+    my $walker = Math::Optimize::Walker->new(
+        score_func    => $objective_function,
+        generator     => $sequence_generator,
+        decision_func => $decision_function,
+        default_max_successive_fails => $neighbor_count,        # see below!
+        log           => $log,
+    );
+
+    # This default_max_successive_fails setting ensures that, on average, a
+    # fraction of 63% of the neighborhood of each sequence is sampled
+    # before giving up. To sample on average a fraction of x of the space, set
+    #   default_max_fails = -ln(1-x) * neighbor_count.
+    # The rhs is the expected number of samples required to see x of all seqs.
+
+    $walker->run();
+
+    return ( $walker->init_state,    $walker->init_state_score,
+             $walker->current_state, $walker->current_state_score,
+             $walker->step_count,
+    );
+}
+
+
+# Pretty-print the results of a walk.
+# Arguments:
+#   walker_no: id of the current worker
+#   @walker_output: the return value of run_walk().
+# Void, prints results to STDOUT.
+sub print_walker_output {
+    my ( $walker_no, $walk_init_state, $walk_init_state_score,
+         $walk_final_state, $walk_final_state_score, $walk_step_count
+       ) = @_;
+
+    say "### Walker #$walker_no:\n",
+        'Initial sequence: ', $walk_init_state,
+            '  score: ', percent energy2pf $walk_init_state_score, "\n",
+        'Candidate insert: ', $walk_final_state,
+            '  score: ', percent energy2pf $walk_final_state_score,
+            ' after ', $walk_step_count, ' optimization steps';
+}
+
+
+# Construct and run a walker object to optimize a sequence of the given length
+# for the given objective function. The objective is minimized. Then, the
+# results are pretty-printed to STDOUT. The return value indicates whether the
+# optimization yielded a better score than the maximum allowed score
+# (filter-score option).
+# Arguments:
+#   sequence_length:  length of the sequence to optimize
+#   objective_function: code ref that, when called on a sequence, gives back
+#       its score which is to be MINIMIZED
+#   init_temperature: initial temperature for the simulated annealing process
+#   annealing_factor: is multiplied with temperature in each step; in (0,1)
+#   walker_no:        id of the current worker
+# Returns 1 if optimized sequence has a score not higher than the maximum
+# allowed score (option filter-score), and 0 otherwise.
+sub run_walker_and_print {
+    my ( $sequence_length,  $objective_function, $init_temperature,
+         $annealing_factor, $walker_no, $rand_seed,
+       ) = @_;
+
+    my @walker_results = run_walker $sequence_length,
+                                    $objective_function,
+                                    $init_temperature,
+                                    $annealing_factor,
+                                    $rand_seed,
+                                    ;
+    my $walker_score   = $walker_results[3];
+
+    # Cf option filter-score. Filter for probability, not ensemble energies.
+    if (energy2pf $walker_score >= $min_allowed_prob) {
+        print_walker_output($walker_no, @walker_results);
+        print "\n";
+
+        return 1;                       # success
+    }
+    else {
+        return 0;                       # fail
+    }
+}
+
+
+# Returns, for a given sequence, the energy associated with is probability of
+# beeing unstructured (i.e. having no base pairs).
+# Arguments:
+#   sequence: sequence to be scored
+# Returns E_unpaired = -RT ln( Pr[sequence is unpaired] )
+sub score_unstructuredness {
+    my ($sequence) = @_;
+
+    return 0 unless length $sequence > 0;
+
+    my $ensemble_energy_full = ensemble_energy $sequence;
+
+    # The energy of the open chain is defined as 0.
+    my $unstructured_energy = 0 - $ensemble_energy_full;
+    return $unstructured_energy;
+}
+
+
+##############################################################################
+##                                   Main                                   ##
+##############################################################################
+
+print_initial_debug_messages %opt;
+
+##### Seed pseudo-random number generator #####
+srand($rand_seed);
+say "Using random number seed $rand_seed.";
+
+##### Read input sequences and constraints #####
+-s $input_fasta or croak "Input file '$input_fasta' empty or does not exist";
+
+my $fasta_iter = get_file_iter $input_fasta, \&oneline_fasta_iter_factory;
+
+# Read input fasta.
+my @input_records = $fasta_iter->();
+say 'Read ' . scalar(@input_records)
+    . " input sequences from file '$input_fasta'.";
+croak 'No input sequences found' unless @input_records;
+
+
+##### Build objective function #####
+
+# This is an extra objective which assigns a score to the insert itself. Here,
+# an insert is awarded for not having internal base pairs if requested.
+my $score_insert_function = $award_unstructured
+                            ? \&score_unstructuredness
+                            : undef;
+
+# Function that scores the insert with respect to the input sequences.
+my $objective_function = insert_objective_factory $insert_position,
+                                                  $score_insert_function,
+                                                  @input_records;
+
+# Score of input sequences is score of sequences with empty insert
+say "Score of input sequences: ", percent energy2pf $objective_function->(q{});
+
+# Scoring mode: don't optimize, but only score passed insert
+if (defined $insert_to_score) {                 # only score the passed insert
+    # Convert to upper-case for ViennaRNA
+    $insert_to_score = uc $insert_to_score;
+    say 'Scored insert: ', $insert_to_score, ' (length ',
+        length($insert_to_score), ')  score: ',
+        percent energy2pf $objective_function->($insert_to_score);
+
+    exit 0;
+}
+
+say "Requested insert of length $insert_length at position $insert_position.";
+
+
+##### For bruteforce runs, enumerate all sequences and skip the walker ######
+if ($do_bruteforce) {
+    my $number_of_sequences = 4**$insert_length;
+    say "\nPerforming bruteforce optimization with $number_of_sequences ",
+        "sequences. This may take a while...";
+
+    my ($best_insert, $best_insert_score)
+        = bruteforce_optimization $insert_length, $objective_function;
+
+    say "\nCandidate insert: ", $best_insert,
+        '  score: ', percent energy2pf $best_insert_score;
+
+    exit 0;
+}
+
+
+##### Build walker and optimize insert under objective function #####
+say "Running $walker_count walkers using $thread_count threads...\n";
+
+my @status;                             # was optimization successful?
+if ($thread_count == 1) {               # single-threaded
+    foreach my $walker_no (1..$walker_count) {
+        push @status, run_walker_and_print $insert_length,
+                                           $objective_function,
+                                           $init_temperature,
+                                           $annealing_factor,
+                                           $walker_no;
+    }
+}
+else {                                  # multi-threaded
+    require Parallel::Loops;            # parallel for-loop
+    my $parallel_loop = Parallel::Loops->new( $thread_count );
+    my @rand_seeds = map {irand} 1..$walker_count;
+    $parallel_loop->share(\@status, \@rand_seeds);
+
+    $parallel_loop->foreach( [1..$walker_count], sub {
+        my $walker_no = $_;
+        my $rand_seed = $rand_seeds[$walker_no-1];
+        srand($rand_seed);              # seed random generator in each fork
+
+        push @status, run_walker_and_print $insert_length,
+                                           $objective_function,
+                                           $init_temperature,
+                                           $annealing_factor,
+                                           $walker_no,
+                                           $rand_seed,
+                                           ;
+    });
+}
+
+my $success_count = grep {$_} @status;
+say "Finished"
+    . ($min_allowed_prob > 0
+       ? ", successful attempts: $success_count/$walker_count with "
+         . "probability at least " . percent $min_allowed_prob
+       : q{}
+      )
+    . '.';
+
+exit 0;                                 # EOF

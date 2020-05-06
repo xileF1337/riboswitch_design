@@ -15,3 +15,16 @@ Copyright 2015-2020 Sven Findeiß & Felix Kühnl
 
 The code provided in this package is free software released under the
 GNU General Public License v3. Please refer to file `LICENSE`.
+
+## Usage
+
+The `README.md` files in each of the subdirectories contains per-script
+instructions to install dependencies and perform the desired task.
+
+Generally, we recommend the usage of the package manager Conda / Bioconda to
+easily all required dependencies. We refer to the official docs for
+instructions on how to install Conda and set up the Bioconda channel:
+<https://bioconda.github.io/user/install.html>
+
+
+

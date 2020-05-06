@@ -1,0 +1,19 @@
+name: opt_ctx
+channels:
+  - conda-forge
+  - bioconda
+  - defaults
+dependencies:
+  - perl-io-null
+  - perl-math-random-mt-auto
+  - perl-getopt-long
+  - perl
+  - perl-scalar-list-utils
+  - perl-autodie
+  - perl-app-cpanminus
+  - viennarna
+  - perl-ipc-system-simple
+  - perl-module-build
+  - perl-sys-info-base
+  - perl-sys-info
+  - perl-parallel-loops

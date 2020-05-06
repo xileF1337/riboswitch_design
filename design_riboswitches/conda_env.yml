@@ -1,0 +1,11 @@
+name: design_rs
+channels:
+  - conda-forge
+  - bioconda
+  - defaults
+dependencies:
+  - perl
+  - perl-scalar-list-utils
+  - perl-autodie
+  - viennarna
+  - perl-ipc-system-simple

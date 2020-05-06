@@ -1,0 +1,9 @@
+>aptamer_N1M7_weigand2010
+GACUGCUUGUCCUUUAAUGGUCCAGUC
+(((((.....((......))..)))))
+# mfe structure
+(((((...(.((......)).)))))) ( -6.20)
+# mfe structure, enforced (soft) constraint 
+(((((...(.((......)).)))))) ( -6.20)
+# eval of constraint + open chain
+(((((.....((......))..))))) ( -5.50)

@@ -1,0 +1,751 @@
+#!/usr/bin/env perl
+# File: design_riboswitches
+#
+# Copyright 2015--2020 Sven Findeiss & Felix Kuehnl
+#
+# This program is free software: you can redistribute it and/or modify
+# it under the terms of the GNU General Public License as published by
+# the Free Software Foundation, either version 3 of the License, or
+# (at your option) any later version.
+#
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU General Public License for more details.
+#
+# You should have received a copy of the GNU General Public License
+# along with this program.  If not, see <https://www.gnu.org/licenses/>.
+
+
+use warnings;
+use v5.12;                  # for state variables. enables strictures.
+use autodie ':all';
+use Scalar::Util qw( looks_like_number );
+use   List::Util qw( min               );
+use Getopt::Long;
+use RNA;
+#adjust modules folder
+# use lib "/homes/bierdepot/sven/bin/MODULES";
+
+
+#adapt to each program
+my $usage= <<'END_OF_USAGE';
+  usage:
+    ./Designer_vXX.pl -aptamerSe SEQUENCE [OTHER OPTIONS]
+
+    Results are written to STDOUT. Errors are written to STDERR.
+
+  dependency:
+           1) Squid and especially its shuffle script
+                => http://eddylab.org/software.html
+           2) ViennaRNA perl binding
+
+  input options:        (specify the sequence on which to operate)
+           -aptamerSe   Aptamer sequence
+           -aptamerSt   Aptamer structure [DEFAULT: mfe structure of aptamer]
+           -linker      linker between Aptamer and terminator
+                        [DEFAULT: random, cf. -random]
+           -aseq        terminator sequence, complementary to aptamer sequence
+                        [DEFAULT:  sequence complementary to aptamer]
+           -polyU       polyU sequence [DEFAULT 8 x 'U']
+
+  generator options:    (specify how candidates are being generated)
+           -random      how many random sequence have to be generated and
+                        added to the spacerDB
+           -seed        seed of random number generator used for the generation
+                        of random sequences [DEFAULT random]
+                        NOTE: the SQUID shuffle tool used for the background
+                        estimation in the z-score calculation does not support
+                        pre-defined random seeds, thus the z-scores will
+                        differ slightly between different runs despite the
+                        same seed being used
+           -spacerDB    file with functional spacer/terminator loop sequences
+                        * each line one sequence
+           -minPos      sequence postion from which on a complementary sequence
+                        is generated [DEFAULT (length(-aptamerSe)/2)]
+           -maxPos      sequence postion up to which a complementary sequence
+                        is generated [DEFAULT length(-aptamerSe) + -seedPairs]
+           -alter       use the alternative functional model [DEFAULT 0]
+           -terminDB    if -alter specify a file with functional terminator
+                        loop sequences (* each line one sequence) otherwise
+                        20 random sequences between 3 and 10 nt are used
+
+  filter options:       (specify criteria the candidates need to fulfill)
+           -minLength   minimal length of the complementary sequence
+                        [DEFAULT 10]
+           -steps       comma separated list of folding steps, e.g. 1,5,10 to
+                        get folding simulations for 1, 5 and 10 nt growing
+                        chain [DEFAULT 5,10]
+           -polyUpairs  allow base pairs in the poly-U stretch [DEFAULT 0]
+           -seedPairs   enforce a number of opening base pairs in the linker
+                        directly downstream of the aptamer to allow rapid
+                        cotranscriptional folding of the terminator if the
+                        ligand is not present [DEFAULT 2]
+                        This option effects -maxPos.
+           -minTermProb minimal terminator probability in the structure
+                        ensemble [DEFAULT 0.95]
+  misc options:
+           -foldPara    additional RNAfold parameter (e.g. --noGU --noLP)
+           -squid       specify the path where you have installed Sean Eddy's
+                        SQUID library and especially its the shuffle program
+                        if it is not installed download at
+                        http://eddylab.org/software.html [DEFAULT ""]
+           -d           print debug
+           -help        print this message
+
+  example:
+    ./Designer_v09.pl -d -foldPara '--noLP' -random 100                     \
+        -spacerDB './spacer_db.txt' -minPos 9 -steps '1,5,10' -seed 1563145 \
+        -polyUpairs -aptamerSe 'GACUGCUUGUCCUUUAAUGGUCCAGUC'                \
+        2> designer.err | tee designer.out
+
+  Version difference:
+  v02: - new Vienna package support
+       - option to give additional RNAfold parameters
+       - create a perfect complement for each 3prime-position of the aptamer
+         sequence and not for 100 randomly choosen ones
+       - create 100 random sequences for each position
+  v03: - use a database of random sequences, where we have shown that they are
+         functional within terminator loops.
+       - generate random sequence database in advance
+       - integrate random sequence generation as sub
+       - U-stretch is by default 8 nucleotides not 7 as before
+  v04: - generate folding paths for steps between 5 and 10 nt
+  v05: - change default settings of the aptamerSeq and aptamerSt
+       - add optional paramter to stop compelemtary sequence creation at [to
+         be tested]
+  v06: - added help option
+       - added new design model
+       - changed from system calls to RNA.pm
+       - added -steps option to select folding steps
+       - added partition function fold output
+       - parameter for folding steps
+       - use a extra terminator loop database
+  v07: - copy that has been moved under gitlab control
+       - check if the correct shuffle program is installed
+       - added -squid option to specify the location of the SQUID shuffle program
+  v08:  [by FK]
+       - added -seed option to allow specification of seed for random seqs
+       - fixed sanity check for RNA::fold
+       - fixed warnings caused by bareword file handles
+       - added message to log the call / parameters used to run this script
+       - minor code clean up and small changes here and there
+  v08b: [by FK]
+       - added -polyUpairs option to allow base pairs in the poly-U stretch
+  v09:  [by FK]
+       - added option -minLength to define minimal length of complementary
+         sequence. before, this filter was hardcoded to value 10.
+       - added -seedPairs filter to enforce a number of opening base pairs in
+         the linker directly downstream of the aptamer [DEFAULT 2]
+       - the -maxPos value may now exceed the aptamer length to explicitly
+         generate seed base pairs inside the linker region
+       - added filter -minTermProb to specify a minimal terminator probability
+         in the structure ensemble
+END_OF_USAGE
+
+# Print out arguments verbatim before arg parsing
+say STDERR "Call: $0 " . join q{ }, @ARGV;
+
+#adapt to used variable(s)
+use strict;
+#version 1 global variable(s)
+use vars qw/$opt_debug/;
+#version 2 local (only in the programm known) variable(s)
+my (    $opt_aptamerSe,     $opt_aptamerSt,             $opt_linker,
+        $opt_aseq,          $opt_polyU,                 $opt_foldPara,
+        $opt_random,        $opt_seed,                  $opt_spacerDB,
+        $opt_maxPos,        $opt_minPos,                $opt_alternative,
+        $opt_help,          $opt_steps,                 $opt_terminDB,
+        $opt_squid,         $opt_polyU_pairs,           $opt_seed_pairs,
+        $opt_min_term_prob, $opt_min_complement_length,
+   ) = (
+        "",                 "",                         "",
+        "",                 'U' x 8,                    "",
+        100,                undef,                      "",
+        0,                  0,                          0,
+        0,                  "5,10",                     "",
+        "",                 undef,                      2,
+        0.95,               10,
+);
+
+#a=s a must be String
+#b=i b must be Integer
+#c=f c must be Float / Decimal
+#d   d = 1 =>  if 'd' is defined, esle d = undef
+usage() unless GetOptions('d|debug'       => \$opt_debug,
+                          'aptamerSe=s'   => \$opt_aptamerSe,
+                          'aptamerSt=s'   => \$opt_aptamerSt,
+                          'linker=s'      => \$opt_linker,
+                          'aseq=s'        => \$opt_aseq,
+                          'polyU=s'       => \$opt_polyU,
+                          'foldPara=s'    => \$opt_foldPara,
+                          'random=i'      => \$opt_random,
+                          'seed=i'        => \$opt_seed,
+                          'spacerDB=s'    => \$opt_spacerDB,
+                          'terminDB=s'    => \$opt_terminDB,
+                          'maxPos=i'      => \$opt_maxPos,
+                          'minPos=i'      => \$opt_minPos,
+                          'minLength=i'   => \$opt_min_complement_length,
+                          'seedPairs=i'   => \$opt_seed_pairs,
+                          'minTermProb=f' => \$opt_min_term_prob,
+                          'alter'         => \$opt_alternative,
+                          'steps=s'       => \$opt_steps,
+                          'polyUpairs'    => \$opt_polyU_pairs,
+                          'squid=s'       => \$opt_squid,
+                          'h|help'        => \$opt_help
+                         );
+
+#debug message will be printet on standard-error if opt_debug is defined
+print STDERR $usage and exit if $opt_help;
+
+#check dependencies:
+#1) Squid and its shuffle script http://eddylab.org/software.html
+system($opt_squid."shuffle -h &> tmp");
+if (`cat tmp` !~ /SQUID/) {;
+  print STDERR "It seems that you've installed a different or no tool that ",
+               "is called shuffle. Download squid from ",
+               "http://eddylab.org/software.html and install it. Use the ",
+               "-squid option to specify the path to squid's shuffle program.\n";
+  `cat tmp`;
+  unlink("tmp");
+  exit;
+}
+$opt_squid .= "shuffle";
+#2) ViennaRNA's perl bindings
+if ( join(q{}, RNA::fold("A")) ne ".0" ) {
+  print STDERR "It seems that the ViennaRNA package and especially its perl ",
+               "binding is not installed.\n Please download and install ",
+               "https://www.tbi.univie.ac.at/RNA/\n";
+}
+
+
+###
+# seed random number generator
+###
+srand $opt_seed if defined $opt_seed;
+
+###
+# set folding parameters
+###
+if ($opt_foldPara ne "") {
+  my @fold_args = split(/\s+/, $opt_foldPara);
+  while (defined (my $arg = shift @fold_args)) {
+    if ($arg =~ /--noLP/) {
+      $RNA::noLonelyPairs = 1;
+      print STDERR "Changed to no lonley base pairs mode.\n";
+    }
+    elsif ($arg =~ /(-d|--dangles)=?(\.*)/) {
+      my $dangles_val = defined $2 ? $2 : shift @fold_args;
+      die "Invalid --dangles value $dangles_val"
+        unless $dangles_val =~ /^\d$/;      # dangles value is a single digit
+      $RNA::dangles = $dangles_val;
+      print STDERR "Set dangles to $dangles_val.\n";
+    }
+    elsif ($arg =~ /(-T|--temp)=?(.*)/) {
+      my $temp_val = defined $2 ? $2 : shift @fold_args;
+      die "Invalid --temp value $temp_val"
+        unless looks_like_number $temp_val; # temperature is a float
+      $RNA::temperature = $temp_val;
+      print STDERR "Set folding temperature to $temp_val.\n";
+    }
+    elsif ($arg =~ /--noGU/) {
+      $RNA::noGU = 1;
+      print STDERR "Changed to no GU mode.\n";
+    }
+    elsif ($arg =~ /--noClosingGU/) {
+      $RNA::no_closingGU = 1;
+      print STDERR "Changed to no closing GU mode.\n";
+    }
+    else{
+      print STDERR "Could not parse fold parameter: ", $arg,"\n";
+      exit 1;
+    }
+  }
+}
+
+# get folding steps
+my @steps = split(/,/, $opt_steps);
+
+# use theophylline as default
+if ($opt_aptamerSe eq "" and $opt_aptamerSt eq "") {
+  $opt_aptamerSe = "AAGUGAUACCAGCAUCGUCUUGAUGCCCUUGGCAGCACUUCA";
+  $opt_aptamerSt = "(((((...((((((((.....)))))...)))...)))))..";
+}
+# if no sequence is given can't do something
+elsif ($opt_aptamerSe eq "") {
+  print STDERR "No sequence but a structure given!\n";
+  exit;
+}
+# if no structure but the sequence is given do mfe prediction and us this structure
+elsif ($opt_aptamerSt eq "") {
+  ($opt_aptamerSt) = RNA::fold($opt_aptamerSe);
+  print STDERR "Wse the predicted structure $opt_aptamerSt for the given aptamer sequence\n";
+}
+
+# set start position from which on a complementary sequence is generated
+if (    $opt_minPos == 0
+     or $opt_minPos > length($opt_aptamerSe)
+     or $opt_minPos < 0
+   ) {
+  $opt_minPos = int(length($opt_aptamerSe)/2);
+  print STDERR "Reset minPos to ", $opt_minPos, "\n";
+}
+
+# set number of requested seed pairs to zero if negative
+if ($opt_seed_pairs < 0) {
+    $opt_seed_pairs = 0;
+    print STDERR "Reset seedPairs to $opt_seed_pairs\n";
+}
+
+# set stop position up to which a complementary sequence is generated
+if (    $opt_maxPos == 0
+     # maxPos can now reach into linker region. It is bounded later.
+     # or $opt_maxPos >  length($opt_aptamerSe)
+     or $opt_maxPos <  $opt_minPos
+   ) {
+  # Ensure existence of seed base pairs by complementing first bases of
+  # linker. For short linkers, bound maxPos later.
+  $opt_maxPos = length($opt_aptamerSe) + $opt_seed_pairs;
+  print STDERR "Reset maxPos to ", $opt_maxPos, "\n";
+}
+
+# fill spacer sequence database
+my @spacerDB = &fillDB($opt_spacerDB, $opt_random, 6, 20);
+print STDERR "generated a spacer sequence database with ", scalar(@spacerDB), "\n";
+
+# fill terminator loop database if alternative model is used
+my @terminDB = ();
+if ($opt_alternative) {
+  @terminDB = &fillDB($opt_terminDB, 20, 3, 10);
+  print STDERR "generated a spacer sequence database with ", scalar(@terminDB), "\n";
+}
+
+#####################
+# start with design #
+#####################
+my $seq = $opt_aptamerSe;
+my $str = $opt_aptamerSt;
+my $counter=1;
+
+# print output header
+print "#>ID:<\t",                       ">region of complementarity<\t",
+      ">linker length<\t",              ">energy of construct<\t",
+      ">energy of constraint fold<\t",  ">energy difference<\t",
+      ">z-score<\t",            ">distance of last bp in constraint fold<\n";
+
+# for each position of the aptamer 3' half generate constructs
+# minimum length of the perfect complementary region is 10 nt
+for(my $i = ($opt_minPos-1); $i < $opt_maxPos; $i++){
+  print STDERR "Antisense perfect sequence position ",$i,"\n" if($opt_debug);
+  my ($complementary_sequence, $pos) = ("",$i);
+
+  ## WTF-Code ahead, commented out and moved into the next for-loop to allow
+  ## linker-dependent generation of comeplementary sequence.
+  ## TODO fix aseq problem
+  #if($opt_aseq ne ""){
+  #  $complementary_sequence = $opt_aseq;
+  #  $pos  = length($seq) - length($complementary_sequence) + 1;
+  #}
+  #else{
+  #  # pos is zero based and $opt_maxPos one based -> no +1 for the length
+  #  $complementary_sequence = substr($seq, $pos, ($opt_maxPos-$pos));
+  #  next if length($complementary_sequence) < $opt_min_complement_length;
+  #  $complementary_sequence =~ tr/ATUCG/UAAGC/;
+  #  $complementary_sequence = reverse($complementary_sequence);
+  #}
+
+  #iterate over the spacerDB
+  for(my $j=0; $j<$opt_random; $j++){
+    my @OUT=();
+    my    ($polyU,     $linker, $passed_filters, $consE, $folE, $zscore, $terminator)
+        = ("UUUUUUUU",      "",               1,      0,     0,       0,          "");
+
+    $linker = ($opt_linker ne "") ? $opt_linker : $spacerDB[$j];
+
+    # Generate complementary sequence that forms terminator. To ensure
+    # existence of seed base pairs, this step can depend on the linker.
+    $complementary_sequence = do {
+        my $current_maxPos = min $opt_maxPos, length($seq . $linker);
+        say STDERR "-maxPos reduced to $current_maxPos for linker $linker"
+            if $current_maxPos < $opt_maxPos;
+        # pos is zero based and $opt_maxPos one based -> no +1 for the length
+        reverse_complement( substr($seq . $linker, $pos, ($opt_maxPos-$pos)) )
+    };
+    # Ensure minimal length of complementary region
+    next if length($complementary_sequence) < $opt_min_complement_length;
+
+    if($opt_polyU ne ""){
+      $polyU = $opt_polyU;
+    }
+
+    my @construct = ($seq,$linker,$complementary_sequence,$polyU);
+
+    # if the alternative functional model should be used we need to have a construct like
+    # $seq,$linker,$complementary_sequence,linker2,$aaseq,linker3,$complementary_sequence,$polyU
+    if($opt_alternative){
+      my $aaseq = reverse_complement($complementary_sequence);
+
+      @construct = ( $seq, $linker, $complementary_sequence,
+                     $spacerDB[int(rand(scalar(@spacerDB)))],
+                     $aaseq,
+                     $terminDB[int(rand(scalar(@terminDB)))],
+                     $complementary_sequence, $polyU
+                   );
+    }
+
+    my $t = $seq.$linker;
+    my ($fold, $x) = RNA::fold($t);
+
+    #reject if fold does not start with the aptamer structure
+    if($fold !~ /^$str/){
+      $passed_filters = 0;
+    }
+
+    $t = join("", @construct);
+
+    #print folding paths between 5 and 10 nt
+    foreach my $step (@steps){
+      push @OUT, "\nFolding Path ", $step," nt steps:\n";
+      for(my $k=10; $k<=length($t); $k=$k+$step){
+        my $subseq = substr($t, 0, $k);
+        my ($fold, $x) =  RNA::fold($subseq);
+        #check aptamer and linker do not destroy the aptamer structure
+        if(length($subseq) > length($seq) and length($subseq) <= length($seq.$linker)){
+
+          # match sub structure of the fold and the given structure of
+          # the aptamer to the last closing base pair -> truncate the
+          # aptamer structure and remove unpaired bases at the end
+          if (    substr($fold, 0, (length($str) - (length($str) - (rindex($str, ")")+1))))
+               ne substr($str,  0, (rindex($str, ")")+1))
+             ){
+            print STDERR "REMOVED: intermediate ", $step, " nt step\t",
+                         $subseq, "\t", $fold, "\t",
+                         substr($str, 0, (rindex($str, ")")+1)), "\n";
+            $passed_filters = 0;
+          }
+        }
+        push @OUT, $subseq, "\n", $fold, " ", sprintf("%2.2f", $x), "\n";
+      }
+    }
+    push @OUT, "\n" if @steps;          # add a blank line after last step
+
+    #check full lenght fold
+    my $subseq = $t;
+    ($fold, $folE) = RNA::fold($subseq);
+    # say STDERR "seq : $subseq";
+    # say STDERR "fold: $fold";
+    # say STDERR "pos : ", q{ } x $pos, "^ ($pos zero-based)";
+
+    # my $terminatorfold = substr($fold, ($pos+1));   # original, why pos+1?
+    # my $terminatorfold = substr($fold, $pos);
+
+    # If there are base pairs in poly U stretch, extend term upstream.
+    # More opening base pairs directly upstream in aptamer => extend
+    substr($fold, 0, $pos) =~ / ( [(] [(.]* )? $ /x;
+    my $term_start_pos = $-[0];           # matching position of pattern
+    my $terminatorfold = substr($fold, $term_start_pos);
+    # say STDERR "term: ", q{ } x $term_start_pos, $terminatorfold;
+
+    # if we use the alternative functional model the terminatorfold should only be the last
+    # stem loop we can dedect within the structure, i.e. $aaseq,linker3,$complementary_sequence,$polyU
+    if ($opt_alternative) {
+      $terminatorfold = substr($terminatorfold, (length($terminatorfold)
+                                                 - length($construct[-1])
+                                                 - length($construct[-2])
+                                                 - length($construct[-3])
+                                                 - length($construct[-4])
+                                                )
+                              );
+    }
+
+
+    $terminator = $terminatorfold;
+    $terminatorfold =~ s/\.//gi;
+
+    #full length fold should destroy the aptamer structure
+    if (substr($fold, 0, length($str)) eq $str) {
+      $passed_filters = 0;
+      print STDERR "REMOVED: binding pocket not sequestered\t>", $fold, "<\t>", $str, "<\n";
+    }
+    #full length fold should have a terminator structure at the 3' end
+    elsif ($terminatorfold !~ /^([(]+[)]+$)/) {
+      $passed_filters = 0;
+      print STDERR "REMOVED: no terminator hairpin\t", $terminatorfold, "\t",
+                   $terminator, "\t", join(" ", @construct),"\n";
+    }
+    #no base pairs should be formed in the polyU track
+    elsif (not $opt_polyU_pairs and $terminator =~ /(\.*)$/) {
+      if (length($1) < length($polyU)) {
+        $passed_filters = 0;
+        print STDERR "REMOVED: base pairs in polyU track ", $terminator, "\n";
+      }
+    }
+    # aptamer stem must be followed by as many seed base pairs as requested
+    elsif (not substr($fold, length($seq)) =~ /^[(]{$opt_seed_pairs}/) {
+      $passed_filters = 0;
+      print STDERR "REMOVED: missing seed base pairs in terminator:\n",
+                   $seq, '_' x $opt_seed_pairs, "\n$fold\n--\n";
+    }
+
+    # ensure proabability of terminator in ensemble is above a threshold
+    if ($passed_filters) {
+      #  say STDERR $subseq;
+      #  say STDERR ('.' x $term_start_pos) . $terminator;
+      # my $terminator_prob = struct_prob( $subseq, '.' x ($pos+1) . $terminator );
+      my $terminator_prob
+        = struct_prob($subseq, ('.' x $term_start_pos) . $terminator );
+      push @OUT, 'Pr[ terminator | no ligand ] = ',
+                 int(100*$terminator_prob + 0.5),   # round to whole percent
+                 "%\n";
+
+      if ($terminator_prob < $opt_min_term_prob) {
+        $passed_filters = 0;
+        print STDERR "REMOVED: terminator probability $terminator_prob < ",
+                     "$opt_min_term_prob\n";
+      }
+    }
+
+
+    #check if the aptamer bound structure contains structural elements
+    #in front of the polyU track -> they could terminate transcription
+    #and will be rejected
+    my $extstr = $str."." x(length($subseq)-length($str));
+    $RNA::fold_constrained = 1;
+    my ($consFold) = RNA::fold($subseq, $extstr);
+    $RNA::fold_constrained = 0;
+    if ($consFold =~ /(\.*)$/) {
+      if (length($1) <= length($polyU)) {
+            $passed_filters = 0;
+            print STDERR "REMOVED: structural element in front of the polyU track ",
+                         $consFold, "\n";
+      }
+    }
+
+    # if we passed all filtering steps calculate some additional numbers and write output
+    if ($passed_filters) {
+      push @OUT, "mfe Fold:\n",
+                 join("", @construct), "\n",
+                 $fold, " ", sprintf("%2.2f", $folE), "\n";
+      #constraint fold
+      my $extstr = $str."." x(length($subseq)-length($str));
+      print STDERR "constraint fold\n", $subseq, "\n", $extstr, "\n"
+        if ($opt_debug);
+
+      $RNA::fold_constrained = 1;
+      my ($fold, $consE) = RNA::fold($subseq, $extstr);
+      $RNA::fold_constrained = 0;
+
+      # estimate z-score for the aptamer downstream region if aptamer is bound
+      $zscore = sprintf "%.2f", &zscore(substr($subseq, length($seq)));
+
+      push @OUT, "constraint Fold:\n",
+                 $fold, " ", sprintf("%2.2f", $consE), "\n";
+
+      printf "\n\nDATA%d:\t%d-%d:%d\t%d\t%2.2f\t%2.2f\t%2.2f\t%2.2f\t%d\n",
+             $counter, ($pos+1), $opt_maxPos, length($complementary_sequence),
+             length($linker), $folE, $consE, ($consE-$folE), $zscore,
+             (length($fold)-(rindex($fold, ")")+1));
+      print "Sequence/Partition function folds:\n", join(" ", @construct), "\n";
+
+      my ($pf_fold, $pf_energy) = RNA::pf_fold($subseq);
+      my $p = 0;
+      foreach my $element (@construct){
+        print substr($pf_fold, $p, length($element)), " ";
+        $p += length($element);
+      }
+      printf "%2.2f\n", $pf_energy;
+
+      $RNA::fold_constrained = 1;
+      ($pf_fold, $pf_energy) = RNA::pf_fold($subseq, $extstr);
+      $RNA::fold_constrained = 0;
+      $p = 0;
+      foreach my $element (@construct){
+        print substr($pf_fold, $p, length($element)), " ";
+        $p += length($element);
+      }
+      printf "%2.2f\n", $pf_energy;
+
+      print join("", @OUT);
+      $counter++;
+    }
+    # take the exit if only a given construct has to be evaluated
+    last if $opt_aptamerSe and $opt_aptamerSt and $opt_linker;
+  }
+  last if $opt_aptamerSe and $opt_aptamerSt and $opt_linker;
+}
+# remove files
+# unlink("rna.ps", "tmp", "tmp.shuf");
+-e and unlink $_ foreach qw( rna.ps tmp tmp.shuf );
+# -e and unlink foreach qw( rna.ps tmp tmp.shuf ); # NOT WORKING
+# TODO There must be some race condition in the code. The above two lines are
+# semantically equal. @zscore() creates the files, but handles are closed.
+# Unlink returns 0 on them, wtf.
+
+
+########################
+###### BEGIN SUBS ######
+########################
+
+# takes a file in ll fasta format, a number how many sequence the
+# database should contain and a minimum and maximum value that defines
+# the random generated sequence lengths
+sub fillDB{
+  my ($file, $number, $min, $max) = @_;
+  # read in a give database file
+  my @DB = ();
+  if (-e $file) {
+    open( my $fi_handle, $file) or die "can't open ", $file, "\n";
+    while(<$fi_handle>){
+      chomp($_);
+      if ($_ =~ /^[ACGTUacgtu]+$/) {
+        push(@DB, $_);
+      }
+      else{
+        print STDERR "ignore line in ", $file, "\t", $_, "\n";
+      }
+    }
+    close($fi_handle);
+  }
+
+  # generate additional random sequence of lengths between $min and $max nt
+  my $c_size = scalar(@DB);
+  for(my $i=0; $i<$number; $i++){
+    if ($i >= $c_size) {
+      my $l = $min+int(rand(($max-$min)));
+      push(@DB, &randomseq("AUGC",$l,1));
+    }
+  }
+  return @DB;
+}
+
+
+
+# generate random sequence
+sub randomseq{
+  my ($alphabet, $length, $count) = @_;
+  # srand;
+  my @A = (defined $alphabet) ? (split //, $alphabet) : qw/A U G C/;
+  $length = ($length > 1) ? $length : 1;
+  $count = ($count > 1) ? $count : 1;
+  my @results = ();
+  for(1..$count) {
+    push(@results, join '', @A[map {rand @A} 1..$length]);
+  }
+  return @results;
+}
+
+
+#takes: a sequence
+#returns: z-score
+sub zscore{
+  my ($givenSeq) = @_;
+  print STDERR "Z-Score:\t", $givenSeq, "\n" if $opt_debug;
+  open my $fo_handle, '>', 'tmp' or die "can't open tmp\n";
+  print {$fo_handle} ">tmp\n", $givenSeq, "\n";
+  close $fo_handle;
+  # TODO make squid shuffle obay the user-defined random seed
+  system("$opt_squid -d -n 1000 -o tmp.shuf tmp");
+  my @a = split(/\n/, `cat tmp.shuf`);
+  my @MFEs = ();
+  my $seq = "";
+  foreach my $a (@a){
+    if ($a =~ /^>/ && $seq ne "") {
+      my ($fold, $mfe) = RNA::fold($seq);
+      push(@MFEs, $mfe);
+      $seq = "";
+    }
+    elsif ($a =~ /^>/) {
+      $seq = "";
+    }
+    else{
+      $seq .= $a;
+    }
+  }
+  my ($mean,$std)=&meanstd(\@MFEs, scalar(@MFEs));
+  my ($fold, $mfe) = RNA::fold($givenSeq);
+
+  my $z = 0;
+  $z = ($mfe - $mean)/$std if ($std);
+  $z = 100 unless($std);
+  return $z;
+}
+
+#takes: a array of numbers and n (normally n=scalar(array))
+#returns: mean, std
+sub meanstd {
+  my ($numsref, $n)=@_;
+  my $mean;
+  my $std;
+  die "Exit Aeh: Do dimd wos nit <$n>lt<" , scalar(@$numsref), ">!\n"
+    unless $n >= scalar(@$numsref) && $n != 0;
+  my $sum=0;
+  foreach my $i (@$numsref) {
+    $sum+=$i;
+  }
+  $mean=$sum/$n;
+  $sum=0;
+  foreach my $i (@$numsref) {
+    $sum+=(($i-$mean)*($i-$mean));
+  }
+  #print "sum:$sum n:$n\n";
+  if ($n>1) {
+    $std=sqrt($sum/($n-1));
+  }
+  else {
+    $std='na';
+  }
+  return $mean, $std;
+}
+
+
+# Computes the probability of structures matching a given constraint.
+# Arugments:
+#   sequence
+#   constraint: structural constraint in ViennaRNA notation; partition
+#       function of all matching structures is computed
+# Returns: probability of all structures matchin the constraint in the ensemble
+sub struct_prob {
+  my ($sequence, $constraint) = @_;
+
+  # Store fold_constrained global var value and restore it later
+  my $old_fold_constrained = $RNA::fold_constrained;
+  $RNA::fold_constrained = 1;       # enable (hard) constraint folding
+
+  my ($ensemble_energy_full, $ensemble_energy_constr);
+  eval {
+      $ensemble_energy_full   = ( RNA::pf_fold($sequence             ) )[1];
+      $ensemble_energy_constr = ( RNA::pf_fold($sequence, $constraint) )[1];
+  };
+  say STDERR "RNA::pf_fold error: sequence $sequence   constraint $constraint"
+        and return 0.0
+    if $@;
+
+  # Restore global var value
+  $RNA::fold_constrained = $old_fold_constrained;
+
+  # Define constants
+  state $R = RNA::GASCONST / 1000;       # universal gas constant for kcal/mol
+  state $T = 273.15 + $RNA::temperature; # temperature in Kelvin
+  state $RT_inv = 1 / ($R * $T);
+
+  # Compute probability
+  my $struct_prob = exp(
+                         ($ensemble_energy_full - $ensemble_energy_constr)
+                         * $RT_inv
+                       );
+
+  return $struct_prob;
+}
+
+
+# Compute the reverse complement of a DNA/RNA sequence, converting Ts to Us
+# Arguments:
+#   sequence: the input sequence to be reverse-complemented
+# Returns the reverse complement of the input sequence, with Ts converted to U
+sub reverse_complement {
+    my $sequence = shift;
+    $sequence =~ tr/ATUCG/UAAGC/;
+    return reverse($sequence);
+}
+
+__END__
