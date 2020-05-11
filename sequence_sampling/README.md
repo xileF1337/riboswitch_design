@@ -16,7 +16,7 @@ the Perl bindings. So up to now, please install RNAblueprint manually:
 <https://github.com/ViennaRNA/RNAblueprint>
 
 ```bash
-conda env create -f test_blueprint
+conda env create -f conda_env.yml
 ```
 
 ## Usage

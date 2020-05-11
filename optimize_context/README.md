@@ -1,9 +1,10 @@
 # Sequence Context optimization for Transcrptional Riboswitches
 
-For a given riboswitch and a 5' leader sequence, design a decoupling sequence
-insert placed between both sequences that minimizes the structural
-interference between leader and riboswitch, i.e., which minimizes the
-probability that base pairs form between these two domains.
+For a given 5' leader sequence and a riboswitch, design a decoupling
+sequence insert placed between both sequences that minimizes the
+structural interference between leader and riboswitch, i.e., which
+minimizes the probability that base pairs form between these two
+domains.
 
 ## Dependencies
 

@@ -101,7 +101,7 @@ Arguments:  [...] denotes default values, xx doubles, ii ints, ss strings
     -l, --length ii:    Length of the insert. [5]
     -u, --unstructured:
         Award designed inserts for not having internal base pairs.
-        TODO weigh this requirements against other scores. Currently, a higher
+        TODO weight this requirement against other scores. Currently, a higher
         number of input sequences will reduce the weight of this criterion.
     -m, --max-mono ii:
         The maximum length of mono-nucleotide stretches (UUUUU, AAA etc.)
@@ -119,12 +119,12 @@ Arguments:  [...] denotes default values, xx doubles, ii ints, ss strings
     -T, --init-temp xx:
         Initial temperature for the simulated annealing optimization. Large
         temperatures lead to a more uniform sampling. [1000]
-    -a, anneal-factor:
+    -a, anneal-factor xx:
         Factor that is multiplied with the temperature in each optimization
         step to simmulate a cooldown. Must lie in interval (0,1). Smaller
         values accelerate the cooldown process and reduces the required
         optimization steps. [0.99]
-    -f, --filter-prob:
+    -f, --filter-prob xx:
         Only print the result of an optimization walker if its probability is
         at least this value. [0]
     -S, --seed ii:      Manually set the random number seed. [RANDOM]
