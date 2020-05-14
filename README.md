@@ -34,10 +34,16 @@ sh Miniconda3-latest-Linux-x86_64.sh
 
 You may need to restart your shell.  Next, set up the Bioconda channels:
 
-```
+```bash
 conda config --add channels defaults
 conda config --add channels bioconda
 conda config --add channels conda-forge
+```
+
+Finally, update Conda to the latest version:
+
+```bash
+conda update --yes conda
 ```
 
 Now, please follow the instructions in the `README.md` files in the
