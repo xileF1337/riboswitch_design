@@ -21,24 +21,28 @@ use warnings;
 use v5.12;                  # for state variables. enables strictures.
 use autodie ':all';
 use Scalar::Util qw( looks_like_number );
-use   List::Util qw( min               );
+use   List::Util qw( min shuffle       );
 use Getopt::Long;
 use RNA;
 #adjust modules folder
 # use lib "/homes/bierdepot/sven/bin/MODULES";
 
+our $VERSION = 10;
+my  $URL     = 'https://github.com/xileF1337/riboswitch_design/';
+
 
 #adapt to each program
 my $usage= <<'END_OF_USAGE';
   usage:
-    ./Designer_vXX.pl -aptamerSe SEQUENCE [OTHER OPTIONS]
+    ./design_riboswitches -aptamerSe SEQUENCE [OTHER OPTIONS]
 
     Results are written to STDOUT. Errors are written to STDERR.
 
   dependency:
-           1) Squid and especially its shuffle script
-                => http://eddylab.org/software.html
-           2) ViennaRNA perl binding
+           - ViennaRNA perl binding
+
+           We recommend Bioconda to install the dependencies:
+           https://bioconda.github.io/user/install.html
 
   input options:        (specify the sequence on which to operate)
            -aptamerSe   Aptamer sequence
@@ -54,11 +58,6 @@ my $usage= <<'END_OF_USAGE';
                         added to the spacerDB
            -seed        seed of random number generator used for the generation
                         of random sequences [DEFAULT random]
-                        NOTE: the SQUID shuffle tool used for the background
-                        estimation in the z-score calculation does not support
-                        pre-defined random seeds, thus the z-scores will
-                        differ slightly between different runs despite the
-                        same seed being used
            -spacerDB    file with functional spacer/terminator loop sequences
                         * each line one sequence
            -minPos      sequence postion from which on a complementary sequence
@@ -86,10 +85,6 @@ my $usage= <<'END_OF_USAGE';
                         ensemble [DEFAULT 0.95]
   misc options:
            -foldPara    additional RNAfold parameter (e.g. --noGU --noLP)
-           -squid       specify the path where you have installed Sean Eddy's
-                        SQUID library and especially its the shuffle program
-                        if it is not installed download at
-                        http://eddylab.org/software.html [DEFAULT ""]
            -d           print debug
            -help        print this message
 
@@ -141,31 +136,29 @@ my $usage= <<'END_OF_USAGE';
          generate seed base pairs inside the linker region
        - added filter -minTermProb to specify a minimal terminator probability
          in the structure ensemble
+  v10:  [by FK] 2020-05-14
+       - removed SQUID dependency, shuffle in Perl
+       - cleaned up code, removed sections long commented out
 END_OF_USAGE
 
-# Print out arguments verbatim before arg parsing
+# Print out arguments verbatim before arg parsing.
 say STDERR "Call: $0 " . join q{ }, @ARGV;
 
-#adapt to used variable(s)
-use strict;
-#version 1 global variable(s)
-use vars qw/$opt_debug/;
-#version 2 local (only in the programm known) variable(s)
 my (    $opt_aptamerSe,     $opt_aptamerSt,             $opt_linker,
         $opt_aseq,          $opt_polyU,                 $opt_foldPara,
         $opt_random,        $opt_seed,                  $opt_spacerDB,
         $opt_maxPos,        $opt_minPos,                $opt_alternative,
         $opt_help,          $opt_steps,                 $opt_terminDB,
-        $opt_squid,         $opt_polyU_pairs,           $opt_seed_pairs,
-        $opt_min_term_prob, $opt_min_complement_length,
+        $opt_polyU_pairs,   $opt_seed_pairs,            $opt_min_term_prob,
+        $opt_version,       $opt_min_complement_length, $opt_debug,
    ) = (
         "",                 "",                         "",
         "",                 'U' x 8,                    "",
         100,                undef,                      "",
         0,                  0,                          0,
         0,                  "5,10",                     "",
-        "",                 undef,                      2,
-        0.95,               10,
+        undef,              2,                          0.95,
+        0,                  10,                         0,
 );
 
 #a=s a must be String
@@ -191,31 +184,23 @@ usage() unless GetOptions('d|debug'       => \$opt_debug,
                           'alter'         => \$opt_alternative,
                           'steps=s'       => \$opt_steps,
                           'polyUpairs'    => \$opt_polyU_pairs,
-                          'squid=s'       => \$opt_squid,
-                          'h|help'        => \$opt_help
+                          'h|help'        => \$opt_help,
+                          'v|version'     => \$opt_version,
                          );
 
 #debug message will be printet on standard-error if opt_debug is defined
-print STDERR $usage and exit if $opt_help;
-
-#check dependencies:
-#1) Squid and its shuffle script http://eddylab.org/software.html
-system($opt_squid."shuffle -h &> tmp");
-if (`cat tmp` !~ /SQUID/) {;
-  print STDERR "It seems that you've installed a different or no tool that ",
-               "is called shuffle. Download squid from ",
-               "http://eddylab.org/software.html and install it. Use the ",
-               "-squid option to specify the path to squid's shuffle program.\n";
-  `cat tmp`;
-  unlink("tmp");
-  exit;
+print $usage and exit if $opt_help;
+if ($opt_version) {
+    say "Riboswitch designer version $VERSION";
+    say "Written by Sven Findeiss and Felix Kuehnl, $URL";
+    exit;
 }
-$opt_squid .= "shuffle";
-#2) ViennaRNA's perl bindings
+
+#check dependencies: ViennaRNA's perl bindings
 if ( join(q{}, RNA::fold("A")) ne ".0" ) {
-  print STDERR "It seems that the ViennaRNA package and especially its perl ",
-               "binding is not installed.\n Please download and install ",
-               "https://www.tbi.univie.ac.at/RNA/\n";
+  print STDERR "It seems that the ViennaRNA package and especially its Perl ",
+               "bindings are not installed.\nPlease download and install from",
+               "https://www.tbi.univie.ac.at/RNA/ or better use Bioconda.\n";
 }
 
 
@@ -300,7 +285,6 @@ if ($opt_seed_pairs < 0) {
 # set stop position up to which a complementary sequence is generated
 if (    $opt_maxPos == 0
      # maxPos can now reach into linker region. It is bounded later.
-     # or $opt_maxPos >  length($opt_aptamerSe)
      or $opt_maxPos <  $opt_minPos
    ) {
   # Ensure existence of seed base pairs by complementing first bases of
@@ -338,21 +322,6 @@ print "#>ID:<\t",                       ">region of complementarity<\t",
 for(my $i = ($opt_minPos-1); $i < $opt_maxPos; $i++){
   print STDERR "Antisense perfect sequence position ",$i,"\n" if($opt_debug);
   my ($complementary_sequence, $pos) = ("",$i);
-
-  ## WTF-Code ahead, commented out and moved into the next for-loop to allow
-  ## linker-dependent generation of comeplementary sequence.
-  ## TODO fix aseq problem
-  #if($opt_aseq ne ""){
-  #  $complementary_sequence = $opt_aseq;
-  #  $pos  = length($seq) - length($complementary_sequence) + 1;
-  #}
-  #else{
-  #  # pos is zero based and $opt_maxPos one based -> no +1 for the length
-  #  $complementary_sequence = substr($seq, $pos, ($opt_maxPos-$pos));
-  #  next if length($complementary_sequence) < $opt_min_complement_length;
-  #  $complementary_sequence =~ tr/ATUCG/UAAGC/;
-  #  $complementary_sequence = reverse($complementary_sequence);
-  #}
 
   #iterate over the spacerDB
   for(my $j=0; $j<$opt_random; $j++){
@@ -634,39 +603,33 @@ sub randomseq{
   return @results;
 }
 
+# Shuffle (mono-nucleotides of) a sequence. Generate n differently shuffled
+# sequences.
+# Arguments:
+#   seq: the sequence to be shuffled
+#   n:_  number of shuffled sequences to be generated
+# Returns a list of n shuffled sequences.
+sub shuffle_seq {
+    my ($seq, $n) = @_;
+    my @nucleotides = split //, $seq;
+    my @shuffled_seqs = map {join q{}, shuffle @nucleotides} 1..$n;
+    return @shuffled_seqs;
+}
 
-#takes: a sequence
-#returns: z-score
+# Estimates a z-score for a given sequence. The energy background is estimated
+# using mononucleotide shuffling of the input sequence.
+# returns: z-score
 sub zscore{
   my ($givenSeq) = @_;
   print STDERR "Z-Score:\t", $givenSeq, "\n" if $opt_debug;
-  open my $fo_handle, '>', 'tmp' or die "can't open tmp\n";
-  print {$fo_handle} ">tmp\n", $givenSeq, "\n";
-  close $fo_handle;
-  # TODO make squid shuffle obay the user-defined random seed
-  system("$opt_squid -d -n 1000 -o tmp.shuf tmp");
-  my @a = split(/\n/, `cat tmp.shuf`);
-  my @MFEs = ();
-  my $seq = "";
-  foreach my $a (@a){
-    if ($a =~ /^>/ && $seq ne "") {
-      my ($fold, $mfe) = RNA::fold($seq);
-      push(@MFEs, $mfe);
-      $seq = "";
-    }
-    elsif ($a =~ /^>/) {
-      $seq = "";
-    }
-    else{
-      $seq .= $a;
-    }
-  }
-  my ($mean,$std)=&meanstd(\@MFEs, scalar(@MFEs));
-  my ($fold, $mfe) = RNA::fold($givenSeq);
 
-  my $z = 0;
-  $z = ($mfe - $mean)/$std if ($std);
-  $z = 100 unless($std);
+  my @shuffled_seqs = shuffle_seq($givenSeq, 1000);
+  my @MFEs          = map { (RNA::fold($_))[1] } @shuffled_seqs;
+
+  my ($mean,$std)   = meanstd(\@MFEs, scalar(@MFEs));
+  my ($fold, $mfe)  = RNA::fold($givenSeq);
+  my $z             = $std  ?  ($mfe-$mean) / $std  :  100;
+
   return $z;
 }
 

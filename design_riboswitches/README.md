@@ -6,11 +6,9 @@ pattern, and then applies several filters to remove unsuited constructs from
 the generated set of switches.
 
 
-## Usage
+## Output
 
-Use `design_riboswitches -h` to get help.
-
-## General notes
+TODO explain
 
 -   header for numeric values of generating filter output:
 
@@ -18,12 +16,6 @@ Use `design_riboswitches -h` to get help.
         >energy of construct<  >energy of constraint fold<    >energy difference<
         >z-score<              >distance of last bp in constraint fold<
 
--   position of ribosomal binding site / Shine-Dalgarno sequence: leave
-    enough space to roadblocking neomycin aptamer N1
--   neomycin resistence of E. coli strain?
--   Which concentrations of RNA and ligand will be used?
-    -   Kinetic models usually assume ligand excess, i.e. concentrations
-        in the order of 1 mM of ligand compared to muM of RNA
 
 ## Description of generation step
 
@@ -35,9 +27,14 @@ Use `design_riboswitches -h` to get help.
     -   append a perfect 8-nt poly U stretch
     -   afterwards: filter out inappropriate candidates
 
+## Filtering step
+
+-   developed by Sven Findeiss, extended by Felix Kuehnl
+
+
 ## Dependencies
 
-Please install BioConda, cf. `README.md` in the root directory. Then, run:
+Please install Bioconda, cf. `README.md` in the root directory. Then, run:
 
 ```bash
 conda env create -f ./conda_env.yml
